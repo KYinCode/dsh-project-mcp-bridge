@@ -1,0 +1,46 @@
+{
+  "name": "dsh-project-mcp-bridge",
+  "version": "0.1.0",
+  "description": "Per-project MCP loading for DeepSeek Harness: sessions of a project automatically get the MCP servers declared in its .dsh/mcp.json (mcpServers JSON shape, shared with Claude Code / Cursor / VS Code). Client bridge — consumes MCP servers, not an MCP server, not an official DeepSeek package.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "mcp",
+    "plugin",
+    "cordis"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KYinCode/dsh-project-mcp-bridge.git"
+  },
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "examples/"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-subprocess": "^0.1.0-rc.6",
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}
