@@ -144,6 +144,14 @@ host process environment.
   default** (one live connection per server). Set `"override": true` to
   force the project connection instead (double connection accepted,
   project tools win).
+- **Override does not disable the upper layers.** The project connection is
+  added on top: the upper (host/preset) connections stay alive, and the
+  agent-layer copy shadows same-named tools (layered registry), so the
+  model actually calls the project connection. The tool names carry no
+  origin marker — the plugin logs
+  `... shadows upper-layer registration(s); upper connections stay alive`
+  when an override registers over existing upper registrations; process
+  count is the other way to verify.
 - Different serverNames or different tool names coexist freely.
 - **Note — two bridges, two philosophies**: between official
   `dsh-mcp-client` instances (host rows, preset rows), a duplicate

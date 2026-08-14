@@ -464,7 +464,8 @@ async function teardownServer(ctx, state, serverName, record) {
 
 async function setupServer(ctx, state, entry) {
   const serverName = entry.serverName
-  if (!entry.override && hasServerTools(state.agentCtx, serverName)) {
+  const upper = hasServerTools(state.agentCtx, serverName)
+  if (!entry.override && upper) {
     log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} already provided by preset/host MCP — skipped (set "override": true to force the project connection)`)
     return
   }
@@ -491,7 +492,12 @@ async function setupServer(ctx, state, entry) {
         }
       },
     })
-    log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): registered ${disposers.length} tool(s) from server ${serverName}`)
+    // override:true with upper-layer registrations present = intentional
+    // double connection. The agent-layer copy SHADOWS the upper layers for
+    // same-named tools (layered registry), but the upper connections stay
+    // alive — say so in the log, since the tool list shows no origin.
+    const shadowed = upper ? ' (agent layer shadows upper-layer registration(s) for same-named tools; upper connections stay alive)' : ''
+    log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): registered ${disposers.length} tool(s) from server ${serverName}${shadowed}`)
   } catch (error) {
     log(ctx, 'error', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} not loaded: ${String(error)}`)
   }

@@ -133,6 +133,12 @@ pnpm add dsh-project-mcp-bridge          # 装进 node_modules（不触发 recon
   可见性优先级 **项目 > 预设 > 宿主**。
 - 预设/宿主已提供的 `serverName` **默认跳过**（同一服务保持一份连接）；
   设置 `"override": true` 强制使用项目连接（接受双连接，项目版胜出）。
+- **override 不会关掉上层**：项目连接是**叠加**上去的——上层（宿主/预设）
+  连接照常存活；agent 层的项目副本遮蔽同名工具（分层注册表），模型实际
+  调用的是项目连接。工具名不携带来源标记——插件在 override 覆盖了既有
+  上层注册时，日志会写明
+  `shadows upper-layer registration(s); upper connections stay alive`；
+  进程数量是另一个验证手段。
 - 不同 serverName / 不同工具名天然共存。
 - **注意——两种桥，两种哲学**：官方 `dsh-mcp-client` 实例之间（宿主行、
   预设行）同名 `serverName` 是**进程级唯一**，重复会导致**挂载失败**
