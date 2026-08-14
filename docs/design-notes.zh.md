@@ -72,8 +72,3 @@ Claude Code 装 MCP server 要重开会话——"新包的安装要重载"是全
 - **连接池共享状态**：同一项目多会话共用连接，有状态服务器会看到同一份
   状态。
 
-## 6. 一个值得上游推进的方向
-
-`dsh.profile.bundles` 目前无 watcher（HMR 只监听补丁文件）。技术上可以
-复用同一套 include 机制：监听 package.json → 重新 compose → `entry.update`，
-让 `dsh plugin add` 也免重启。详见 `../dsh-hot-installer/idea.md`。

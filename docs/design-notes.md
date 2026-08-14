@@ -91,9 +91,3 @@ delivers fully via dynamic plugins).
 - **Pooled connections share state**: sessions of one project share one
   connection; stateful servers see one shared state.
 
-## 6. A direction worth pushing upstream
-
-`dsh.profile.bundles` currently has no watcher (HMR watches only the patch
-files). Technically the same include mechanism could serve it: watch
-package.json → recompose → `entry.update`, making `dsh plugin add`
-restart-free too. See `../dsh-hot-installer/idea.md`.
