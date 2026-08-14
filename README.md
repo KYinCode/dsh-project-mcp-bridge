@@ -145,6 +145,15 @@ host process environment.
   force the project connection instead (double connection accepted,
   project tools win).
 - Different serverNames or different tool names coexist freely.
+- **Note — two bridges, two philosophies**: between official
+  `dsh-mcp-client` instances (host rows, preset rows), a duplicate
+  `serverName` is **process-wide unique and fails the mount** ("pick a
+  unique serverName") — that bridge prefers fail-loud over silent
+  shadowing. This plugin, when its project config collides with an upper
+  layer, **skips** instead, so the project session still starts. In
+  practice: project vs host/preset duplicates → skipped (this plugin);
+  preset vs host duplicates among `dsh-mcp-client` rows → rename one.
+
 
 ## Config hot-reload (v2)
 

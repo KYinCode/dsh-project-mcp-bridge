@@ -134,6 +134,12 @@ pnpm add dsh-project-mcp-bridge          # 装进 node_modules（不触发 recon
 - 预设/宿主已提供的 `serverName` **默认跳过**（同一服务保持一份连接）；
   设置 `"override": true` 强制使用项目连接（接受双连接，项目版胜出）。
 - 不同 serverName / 不同工具名天然共存。
+- **注意——两种桥，两种哲学**：官方 `dsh-mcp-client` 实例之间（宿主行、
+  预设行）同名 `serverName` 是**进程级唯一**，重复会导致**挂载失败**
+  （"pick a unique serverName"）——官方桥宁可用失败暴露配置错误，也不用
+  静默遮蔽。本插件的项目配置与上层同名时**默认跳过**，保证项目会话仍能
+  创建。实际含义：项目 vs 宿主/预设重复 → 跳过（本插件）；预设 vs 宿主
+  在 `dsh-mcp-client` 行之间重复 → 必须改名。
 
 ## 配置热重载（v2）
 
