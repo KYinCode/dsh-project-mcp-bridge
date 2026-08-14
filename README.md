@@ -186,6 +186,16 @@ layered registry). Connections stay pooled: N sessions sharing one server
 still share one connection, so the cost is N registrations, not N
 processes.
 
+**Connection supervisor (v3)**: if a server's process dies, the SDK's
+`onclose` fires, the dead pool entry is dropped, and every live session of
+the project rebuilds automatically (~seconds) — no restart, no new
+session, no config change. A rebuild that fails does not retry on its own
+(no reconnect loop); the next trigger (config change, new session, another
+death) retries. Note: after a rebuild, the server's *internal* dependencies
+(e.g. a browser connection) may take a few more seconds to become ready —
+calls in that window can fail with the server's own error; this is server
+behavior, not a bridge defect.
+
 ## Environment scrubbing (privilege reduction)
 
 MCP children are spawned with the official `scrubbedParentEnv()`: the

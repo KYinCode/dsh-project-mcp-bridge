@@ -91,3 +91,35 @@ delivers fully via dynamic plugins).
 - **Pooled connections share state**: sessions of one project share one
   connection; stateful servers see one shared state.
 
+## 6. v3 connection supervisor (design record)
+
+Connections die as a matter of course (sleep/wake, browser restarts,
+manual process kills, server crashes) — and silent death is the worst
+failure: tools stay listed, calls fail forever, no log anywhere. v3 turns
+"silent death" into "auto-revive in seconds".
+
+**Decisions**:
+
+- **Event-driven (SDK `client.onclose`), not polling**: PoC-verified on
+  Windows force-kill of the stdio child (child close → transport.onclose →
+  protocol._onclose → client.onclose). Zero overhead, first-moment
+  awareness.
+- **No backoff retry loop**: a failed rebuild stops and waits for the next
+  trigger (config change, new session, another death). Exponential backoff
+  suits the official bridge (one instance, one connection); a project-level
+  bridge must avoid multi-session rebuild storms — event-driven plus
+  stop-on-failure is simpler and reliable.
+- **Failed rebuilds do not pollute the pool**: connectServer deletes the
+  pool entry on failure; the next trigger retries fresh, no bad connection
+  is cached.
+
+**Race lesson (fixed in 0.1.10)**: `poolPromises.has(key)` ≠ "my
+connection is alive". After onclose drops the pool entry, the FIRST session
+to finish reload rebuilds the connection and refills the pool under the
+SAME poolKey; later sessions' reloads see the pool entry (same fingerprint,
+same key) and skip — but their tool definitions still bind the dead client.
+Symptom: **old sessions Not connected, new sessions fine**. Fix: onclose
+marks every live session's record for the server as `dead`; the skip
+condition requires `!record.dead`, forcing every session to teardown and
+rebuild (reusing the restored pool connection, never duplicating it).
+
