@@ -178,3 +178,9 @@ MCP 子进程使用官方 `scrubbedParentEnv()` 清理后的环境：剔除凭�
 - 连接按 (项目根, serverName) 池化共享；同一项目多个会话共用一份连接，
   最后一个会话释放时关闭。
 - 不支持 MCP 的流式/任务型执行（仅普通 call）。
+
+## 延伸阅读
+
+- [设计笔记：DSH 的哲学与本插件的对齐](docs/design-notes.zh.md) ·
+  [Design notes (English)](docs/design-notes.md) —— DSH 为什么这样分层、
+  它的信任模型、热加载边界，以及"项目级 MCP 为什么是插件的活"。

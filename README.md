@@ -190,8 +190,14 @@ does not and cannot make untrusted projects safe.
 
 ## Limitations
 
-- Resources and prompts from MCP servers are not bridged (tools only).
-- Connections are shared per (projectRoot, serverName): sessions of the
+- Resources and prompts from MCP servers are not bridged (tools only).- Connections are shared per (projectRoot, serverName): sessions of the
   same project share one connection; it closes when the last session
   releases it.
 - Streaming/task-based MCP execution is not supported (call only).
+
+## Further reading
+
+- [Design notes: DSH philosophy and this plugin's alignment](docs/design-notes.md) ·
+  [设计笔记（中文）](docs/design-notes.zh.md) — why DSH is layered the way
+  it is, its trust model, the hot-reload boundary, and why project-level MCP
+  is a plugin's job.
