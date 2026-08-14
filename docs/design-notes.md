@@ -88,8 +88,10 @@ delivers fully via dynamic plugins).
 - **Tools only**: MCP resources/prompts have no consuming surface.
 - **No task-based execution**: plain calls only (same as official
   `dsh-mcp-client`).
-- **Pooled connections share state**: sessions of one project share one
-  connection; stateful servers see one shared state.
+- **Per-agent connections (v4)**: each agent runs its own connection per
+  server — N sessions calling one server = N processes. Isolation over
+  sharing; the idle timeout bounds the cost (unused connections close and
+  release their processes).
 
 ## 6. v3 connection supervisor (design record)
 
@@ -122,4 +124,29 @@ Symptom: **old sessions Not connected, new sessions fine**. Fix: onclose
 marks every live session's record for the server as `dead`; the skip
 condition requires `!record.dead`, forcing every session to teardown and
 rebuild (reusing the restored pool connection, never duplicating it).
+
+## 7. v4: per-agent connections (design record)
+
+v3's race fixes were patches on a shared-pool design: the pool, the
+broadcast, the fingerprints and the `record.dead` flag all existed only to
+serve "one process per (project, server)". v4 removes the pool itself:
+
+- **Per-agent connections**: each agent owns `serverName -> { client,
+  idleTimer }`. Nothing is shared, so nothing can race — the v3 race lesson
+  (§6) is structurally impossible in v4.
+- **Lazy connect**: a connection exists only between the first call and the
+  idle timeout. Session creation registers tool schemas via a one-shot
+  schema sync (connect + listTools + register + close) — schemas only exist
+  on the server, so registration can never be lazy, but the connection
+  after it can be.
+- **Death handling**: `onclose` drops only this agent's connection; the
+  next call reconnects. No supervisor, no broadcast, no rebuild storms.
+- **Cost**: N sessions calling one server = N processes. Accepted by
+  design (isolation), bounded by the idle timeout. The pool's economics
+  (1 process, shared state) are exactly what v4 declines.
+
+Trade-off honesty: for a stateful server (browser automation), per-agent
+connections are strictly better (each session gets its own state); for
+stateless servers they cost extra processes. `idleTimeoutMs` (default 5
+min, `0` = never) is the knob between the two.
 

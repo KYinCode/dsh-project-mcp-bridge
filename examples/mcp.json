@@ -5,7 +5,8 @@
       "args": ["-y", "@modelcontextprotocol/server-github"],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}"
-      }
+      },
+      "idleTimeoutMs": 300000
     },
     "local-api": {
       "url": "http://localhost:3000/mcp",

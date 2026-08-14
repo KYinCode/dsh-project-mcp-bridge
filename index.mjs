@@ -12,36 +12,36 @@
 // Server entry fields (same names as dsh-mcp-client):
 //   stdio:  { command, args?, env?, cwd? }
 //   http:   { url, headers? }
-//   both:   toolCallTimeoutMs? (default 60000), override? (default false)
+//   both:   toolCallTimeoutMs? (default 60000), override? (default false),
+//           idleTimeoutMs? (default 300000; 0 = never idle-disconnect)
 //   env/headers values may reference ${NAME} -> process.env.NAME.
 //
-// v2: CONFIG HOT-RELOAD. Each project's .dsh/mcp.json is watched; saving a
-// change re-resolves the config for every LIVE agent of that project and
-// performs a generation swap:
-//   - added server    -> connect + register tools (live sessions gain them)
-//   - removed server  -> unregister tools + release the pooled connection
-//   - changed server  -> teardown the old generation, connect the new one
-//                        (same serverName keeps the same tool names, so
-//                        recorded tool calls stay replayable)
-// A config that disappears unloads all project MCP tools for live agents.
-// Tool names are stable per serverName, matching the official bridge's
-// hot-replace semantics.
-//
-// Conflict semantics vs. preset/host MCP rows:
-//   - Tools register into the AGENT scope layer, which shadows same-named
-//     tools in the preset layer and the global layer (layered registry).
-//   - By default a serverName already provided by a preset/host row is
-//     SKIPPED (one live connection per server; log explains why). Set
-//     "override": true on the entry to force the project connection
-//     instead (double connection accepted, project tools win).
-//
-// Lifecycle: connections are pooled per (projectRoot, serverName, config
-// fingerprint) and shared across agents of the same project; each agent
-// registers its own tool copies and releases one reference on disposal or
-// generation swap; the pool closes when the last reference leaves.
+// v4 architecture — no connection pool; every agent owns its connections:
+//   - Session creation (agent/created): read .dsh/mcp.json, register tool
+//     schemas via a one-shot sync (connect + listTools + register + close).
+//     No connection is kept: an idle session holds no child process.
+//     Laziness applies to the CONNECTION, never to the REGISTRATION — the
+//     model must see the tool list before it can call anything.
+//   - First call to a server's tool: controller checks the per-server
+//     connection; absent -> lazy connect ("connecting..." logged — that is
+//     the first-call latency) -> call.
+//   - Idle timeout (per-server idleTimeoutMs; default 5 min; 0 = never):
+//     every call re-arms a per-connection timer; on fire the connection
+//     closes and the child process is released; the next call reconnects.
+//   - Unexpected death (client.onclose — verified on Windows force-kill):
+//     THIS controller drops its dead connection; the next call reconnects.
+//     No broadcast, no shared records, no races. N sessions calling one
+//     server = N independent processes (isolation over sharing, by design).
+//   - Disposal (agent/disposed): close all connections, clear timers,
+//     unregister tools.
+//   - Config hot-reload: watchFile still watches .dsh/mcp.json; a change
+//     fully rebuilds this controller (no fingerprint diffing).
+//   - Conflict semantics (unchanged): a serverName already provided by a
+//     preset/host MCP row is SKIPPED by default; "override": true forces the
+//     project connection (agent layer shadows upper layers).
 //
 // Trust model: .dsh/mcp.json is executable project content, same trust as
-// package.json scripts. Child processes run with a scrubbed environment
+// package.json scripts. Children run with a scrubbed environment
 // (credential-shaped and stale DSH_* variables dropped), matching the
 // official dsh-mcp-client bridge.
 //
@@ -64,10 +64,13 @@ const DSH_HOME = process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.d
 // Plugin-scoped log: logs/ root holds directories per plugin, not loose files.
 const LOG_FILE = join(DSH_HOME, 'logs', 'dsh-project-mcp-bridge', 'dsh-project-mcp-bridge.log')
 const DEFAULT_CALL_TIMEOUT_MS = 60000
+const DEFAULT_IDLE_TIMEOUT_MS = 5 * 60 * 1000
 const MAX_PUBLIC_NAME_LENGTH = 64
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g
 const HASH_LENGTH = 12
 const WATCH_DEBOUNCE_MS = 300
+// node timers wrap beyond 2^31-1 ms; clamp idle timeouts at the safe bound.
+const MAX_TIMER_DELAY_MS = 0x7fffffff
 
 // ---------------------------------------------------------------------------
 // logging
@@ -166,6 +169,11 @@ export function serverEntries(servers, projectRoot, warn) {
       }
       for (const [k, v] of Object.entries(raw.headers)) headers[k] = interpolateEnv(v, (m) => warn(`server ${serverName}: ${m}`))
     }
+    let idleTimeoutMs = DEFAULT_IDLE_TIMEOUT_MS
+    if (raw.idleTimeoutMs !== undefined) {
+      if (Number.isFinite(raw.idleTimeoutMs) && raw.idleTimeoutMs >= 0) idleTimeoutMs = Math.floor(raw.idleTimeoutMs)
+      else warn(`server ${serverName}: idleTimeoutMs must be a non-negative number — using default ${DEFAULT_IDLE_TIMEOUT_MS}ms`)
+    }
     entries.push({
       serverName,
       override: raw.override === true,
@@ -177,25 +185,14 @@ export function serverEntries(servers, projectRoot, warn) {
       url: hasUrl ? raw.url : undefined,
       headers,
       toolCallTimeoutMs: Number.isFinite(raw.toolCallTimeoutMs) ? raw.toolCallTimeoutMs : DEFAULT_CALL_TIMEOUT_MS,
+      idleTimeoutMs,
     })
   }
   return entries
 }
 
-/**
- * Stable config fingerprint for one server entry: any change to the entry
- * (command, args, env value, timeout, override, ...) produces a different
- * fingerprint, so the pool key and the change detection both key on it.
- * Env values may contain secrets — the fingerprint lives in memory only.
- */
-export function entryFingerprint(entry) {
-  const { serverName, ...rest } = entry
-  const keys = Object.keys(rest).sort()
-  return JSON.stringify(keys.map((k) => [k, rest[k]]))
-}
-
 // ---------------------------------------------------------------------------
-// transport / client / tool definitions
+// transport / client / definitions
 // ---------------------------------------------------------------------------
 
 function createTransport(entry, projectRoot) {
@@ -212,6 +209,31 @@ function createTransport(entry, projectRoot) {
     })
   }
   return new StreamableHTTPClientTransport(new URL(entry.url), { headers: entry.headers })
+}
+
+/** Connect a fresh client and drain tools/list; closes it on failure. `onClose` fires on transport close (even during connect), `closed` reports whether it died before returning. */
+async function connectAndList(ctx, entry, projectRoot, onClose) {
+  const client = new Client({ name: 'dsh-project-mcp-bridge', version: '4.0.0' })
+  const transport = createTransport(entry, projectRoot)
+  let closed = false
+  client.onclose = () => {
+    closed = true
+    if (onClose) onClose()
+  }
+  try {
+    await client.connect(transport)
+    const tools = []
+    let cursor
+    do {
+      const page = await client.listTools({ cursor })
+      tools.push(...page.tools)
+      cursor = page.nextCursor
+    } while (cursor)
+    return { client, tools, closed }
+  } catch (error) {
+    try { await client.close() } catch { /* best effort */ }
+    throw error
+  }
 }
 
 /** MCP content blocks -> model-facing text (mirrors dsh-mcp-client). */
@@ -242,6 +264,19 @@ function extractText(mcpContent, toolName) {
   return parts.join('\n')
 }
 
+/** callTool result -> model-facing content (isError results throw). */
+function mapResult(result, rawName) {
+  if (!Array.isArray(result.content)) {
+    const rendered = 'toolResult' in result ? JSON.stringify(result.toolResult) : '(no output)'
+    const text = typeof rendered === 'string' ? rendered : '(no output)'
+    if (result.isError === true) throw new Error(text)
+    return { content: [{ type: 'text', text }], ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}) }
+  }
+  const text = extractText(result.content, rawName)
+  if (result.isError === true) throw new Error(text)
+  return { content: result.content, ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}) }
+}
+
 /** Build the canonical output declaration (structured content falls back to JsonValue). */
 function createOutput(rawName) {
   return {
@@ -260,135 +295,40 @@ function createOutput(rawName) {
   }
 }
 
-/** One tool definition; raw MCP name is what travels on the wire. */
-function createDefinition(client, rawName, publicName, tool, entry) {
+/** One tool definition; raw MCP name travels on the wire. The execute preamble is the LAZY CONNECT: resolve the agent's current record, connect on first use, re-arm the idle timer around the call. */
+function createDefinition(state, serverName, rawName, publicName, tool, entry) {
   return {
     name: publicName,
     description: typeof tool.description === 'string' ? tool.description : '',
     parameters: tool.inputSchema,
     output: createOutput(rawName),
     async execute(args, exec) {
-      const signal = AbortSignal.any([exec.signal, AbortSignal.timeout(entry.toolCallTimeoutMs)])
-      const result = await client.callTool(
-        { name: rawName, arguments: typeof args === 'object' && args !== null ? args : {} },
-        undefined,
-        { signal },
-      )
-      if (!Array.isArray(result.content)) {
-        const rendered = 'toolResult' in result ? JSON.stringify(result.toolResult) : '(no output)'
-        const text = typeof rendered === 'string' ? rendered : '(no output)'
-        if (result.isError === true) throw new Error(text)
-        return { content: [{ type: 'text', text }], ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}) }
+      const record = state.servers.get(serverName)
+      if (record === undefined) throw new Error(`server ${serverName} is no longer configured — reload the project config`)
+      const conn = await ensureConnected(state, record)
+      conn.busy++
+      try {
+        armIdle(state, record, conn)
+        const signal = AbortSignal.any([exec.signal, AbortSignal.timeout(record.entry.toolCallTimeoutMs)])
+        const result = await conn.client.callTool(
+          { name: rawName, arguments: typeof args === 'object' && args !== null ? args : {} },
+          undefined,
+          { signal },
+        )
+        return mapResult(result, rawName)
+      } finally {
+        conn.busy--
+        armIdle(state, record, conn)
       }
-      const text = extractText(result.content, rawName)
-      if (result.isError === true) throw new Error(text)
-      return { content: result.content, ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}) }
     },
   }
 }
 
 // ---------------------------------------------------------------------------
-// connection pool (shared per projectRoot+serverName+fingerprint)
+// per-agent controller: one connection set per agent, self-managed
 // ---------------------------------------------------------------------------
 
-const poolPromises = new Map() // key -> Promise<{ client, transport, definitions }>
-const poolRefs = new Map() // key -> number of agents holding a reference
-
-function poolKey(projectRoot, serverName, fingerprint) {
-  return `${projectRoot}\0${serverName}\0${fingerprint}`
-}
-
-async function connectServer(ctx, entry, projectRoot) {
-  const fingerprint = entryFingerprint(entry)
-  const key = poolKey(projectRoot, entry.serverName, fingerprint)
-  const existing = poolPromises.get(key)
-  if (existing !== undefined) return existing
-  const attempt = (async () => {
-    const client = new Client({ name: 'dsh-project-mcp-bridge', version: '1.0.0' })
-    const transport = createTransport(entry, projectRoot)
-    try {
-      await client.connect(transport)
-      const tools = []
-      let cursor
-      do {
-        const page = await client.listTools({ cursor })
-        tools.push(...page.tools)
-        cursor = page.nextCursor
-      } while (cursor)
-      const definitions = new Map()
-      for (const tool of tools) {
-        const publicName = publicToolName(entry.serverName, tool.name)
-        if (definitions.has(publicName)) {
-          throw new Error(`server listed tool "${tool.name}" more than once — invalid tool list`)
-        }
-        definitions.set(publicName, createDefinition(client, tool.name, publicName, tool, entry))
-      }
-      // v3: live connection supervisor. The SDK fires client.onclose when the
-      // stdio child dies (verified on Windows force-kill). Drop the dead pool
-      // entry, mark every live session's record for this server as DEAD (so
-      // their reload cannot skip on the same fingerprint), and re-resolve:
-      // each session tears down its stale tool generation and rebuilds,
-      // sharing the one re-established pool connection.
-      client.onclose = () => {
-        if (poolPromises.get(key) !== attempt) return // superseded by a newer generation
-        poolPromises.delete(key)
-        log(ctx, 'warn', `server ${entry.serverName} (${projectRoot}): connection closed — reconnecting`)
-        for (const state of agentStates.values()) {
-          if (state.disposed || state.projectRoot !== projectRoot) continue
-          const record = state.servers.get(entry.serverName)
-          if (record !== undefined && record.fingerprint === fingerprint) {
-            record.dead = true
-          }
-          enqueue(state, () => reloadFromDisk(state))
-        }
-      }
-      return { client, transport, definitions }
-    } catch (error) {
-      try { await client.close() } catch { /* best effort */ }
-      throw error
-    }
-  })()
-  poolPromises.set(key, attempt)
-  try {
-    await attempt
-    return attempt
-  } catch (error) {
-    poolPromises.delete(key)
-    log(ctx, 'error', `server ${entry.serverName} (${projectRoot}): connection or tool sync failed: ${String(error)}`)
-    throw error
-  }
-}
-
-async function releasePoolRef(ctx, projectRoot, serverName, fingerprint) {
-  const key = poolKey(projectRoot, serverName, fingerprint)
-  const refs = (poolRefs.get(key) ?? 0) - 1
-  if (refs > 0) {
-    poolRefs.set(key, refs)
-    return
-  }
-  poolRefs.delete(key)
-  const promise = poolPromises.get(key)
-  poolPromises.delete(key)
-  if (promise === undefined) return
-  try {
-    const { client } = await promise
-    await client.close()
-    log(ctx, 'info', `server ${serverName} (${projectRoot}): closed (last agent released)`)
-  } catch (error) {
-    log(ctx, 'warn', `server ${serverName} (${projectRoot}): close failed: ${String(error)}`)
-  }
-}
-
-// ---------------------------------------------------------------------------
-// per-agent controller + per-project watcher
-// ---------------------------------------------------------------------------
-
-/**
- * One agent's live state for its project MCP generation:
- *   servers  Map<serverName, { fingerprint, poolKey, unregister() }>
- *   queue    serializes config loads / reloads for this agent
- *   disposed agent is gone; no further work
- */
+/** One agent's live state: servers Map<serverName, record>; record = { entry, unregister, conn, connecting }; conn = { client, idleTimer, busy } or null when disconnected; connecting dedupes concurrent first calls; queue serializes config loads/reloads. */
 function createController(ctx, agent, projectRoot) {
   return {
     ctx,
@@ -409,124 +349,184 @@ function enqueue(state, fn) {
   return state.queue
 }
 
-// per-project watchers: one fs.watchFile per project, fanned out to every
-// live controller of that project.
-const projectWatchers = new Map() // projectRoot -> { controllers: Set, timer, armed }
-
 // Live controllers by agent id; cleanup is driven by the host-level
 // agent/disposed event (agentCtx.effect is unreliable on subagent contexts —
 // its disposer runs immediately there, not on disposal).
 const agentStates = new Map() // agentId -> controller
 
+// per-project watchers: one fs.watchFile per project, fanned out to every
+// live controller of that project. Watchers are config plumbing only — the
+// connections themselves are never shared between agents.
+const projectWatchers = new Map() // projectRoot -> { controllers: Set, timer }
+
 function cleanupState(ctx, state, reason) {
   if (state.disposed) return
   state.disposed = true
   agentStates.delete(state.agent.id)
-  for (const [serverName, record] of [...state.servers]) {
-    teardownServer(ctx, state, serverName, record).catch(() => {})
+  for (const record of [...state.servers.values()]) {
+    teardownServer(state, record, reason).catch(() => {})
   }
   detachWatcher(state)
   log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): cleanup (${reason})`)
 }
 
-function attachWatcher(state) {
-  const root = state.projectRoot
-  let w = projectWatchers.get(root)
-  if (w === undefined) {
-    w = { controllers: new Set(), timer: null }
-    projectWatchers.set(root, w)
-    const configPath = join(root, '.dsh', 'mcp.json')
-    const onChange = () => {
-      if (w.timer !== null) clearTimeout(w.timer)
-      w.timer = setTimeout(() => {
-        w.timer = null
-        for (const controller of [...w.controllers]) {
-          if (!controller.disposed) enqueue(controller, () => reloadFromDisk(controller))
-        }
-      }, WATCH_DEBOUNCE_MS)
-    }
-    w.armed = () => {
-      try {
-        watchFile(configPath, { interval: 500 }, onChange)
-      } catch (error) {
-        log(state.ctx, 'warn', `watch ${configPath} failed: ${String(error)} — config hot-reload disabled for this project`)
-      }
-    }
-    w.armed()
-  }
-  w.controllers.add(state)
-  state.watcherRef = w
+// ---------------------------------------------------------------------------
+// connections: lazy connect, idle timeout, dead detection
+// ---------------------------------------------------------------------------
+
+/** Arm the idle-disconnect timer on a live connection (0 = never). */
+function armIdle(state, record, conn) {
+  clearIdle(conn)
+  if (conn.busy > 0) return // an in-flight call must never be cut off
+  const timeout = record.entry.idleTimeoutMs
+  if (timeout <= 0) return
+  conn.idleTimer = setTimeout(() => {
+    conn.idleTimer = null
+    if (record.conn !== conn) return
+    record.conn = null
+    log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${record.entry.serverName} idle for ${timeout}ms — disconnected (reconnects on next call)`)
+    conn.client.close().catch(() => {})
+  }, Math.min(timeout, MAX_TIMER_DELAY_MS))
+  conn.idleTimer.unref?.()
 }
 
-function detachWatcher(state) {
-  const w = state.watcherRef
-  if (w === undefined) return
-  state.watcherRef = undefined
-  w.controllers.delete(state)
-  if (w.controllers.size === 0) {
-    if (w.timer !== null) clearTimeout(w.timer)
-    try { unwatchFile(join(state.projectRoot, '.dsh', 'mcp.json')) } catch { /* best effort */ }
-    projectWatchers.delete(state.projectRoot)
+function clearIdle(conn) {
+  if (conn.idleTimer !== null) {
+    clearTimeout(conn.idleTimer)
+    conn.idleTimer = null
   }
+}
+
+/** Lazy connect for one server; concurrent callers share one in-flight attempt. */
+async function openConnection(state, record) {
+  const entry = record.entry
+  const conn = { client: null, idleTimer: null, busy: 0 }
+  log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${entry.serverName}: connecting...`)
+  const { client, closed } = await connectAndList(state.ctx, entry, state.projectRoot, () => {
+    // Unexpected transport close: drop the dead connection, reconnect next call.
+    if (record.conn === conn) {
+      record.conn = null
+      clearIdle(conn)
+      log(state.ctx, 'warn', `agent ${state.agent.id} (${state.projectRoot}): server ${entry.serverName} connection closed unexpectedly — reconnecting on next call`)
+    }
+  })
+  conn.client = client
+  if (state.disposed || state.servers.get(entry.serverName) !== record) {
+    try { await client.close() } catch { /* best effort */ }
+    throw new Error(`server ${entry.serverName}: agent disposed or config reloaded during connect`)
+  }
+  record.conn = conn
+  if (closed) {
+    // Died during connect (or in the gap above, before conn was current — the
+    // handler no-ops then); mark dead so the next call retries fresh.
+    record.conn = null
+    clearIdle(conn)
+    try { await client.close() } catch { /* best effort */ }
+    throw new Error(`server ${entry.serverName}: connection closed during connect`)
+  }
+  armIdle(state, record, conn)
+  log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${entry.serverName} connected`)
+  return conn
+}
+
+/** Get the live connection for a record, connecting lazily when absent. */
+function ensureConnected(state, record) {
+  if (record.conn !== null) return Promise.resolve(record.conn)
+  if (record.connecting === null) {
+    const attempt = openConnection(state, record)
+    record.connecting = attempt
+    attempt.catch(() => {}).finally(() => {
+      if (record.connecting === attempt) record.connecting = null
+    })
+  }
+  return record.connecting
+}
+
+/** Close the live connection (intentional: idle, reload, disposal). */
+async function disconnect(state, record, reason) {
+  const conn = record.conn
+  if (conn === null) return
+  record.conn = null
+  clearIdle(conn)
+  try { await conn.client.close() } catch { /* best effort */ }
+  log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${record.entry.serverName}: ${reason}`)
+}
+
+// ---------------------------------------------------------------------------
+// schema sync + registration
+// ---------------------------------------------------------------------------
+
+/** One-shot schema sync: connect, list tools, register definitions, close. Registration is eager (the model must see the tool list before it can call); the connection is the lazy part — released right after. */
+async function syncSchema(state, entry) {
+  const { client, tools } = await connectAndList(state.ctx, entry, state.projectRoot)
+  try {
+    const definitions = new Map()
+    for (const tool of tools) {
+      const publicName = publicToolName(entry.serverName, tool.name)
+      if (definitions.has(publicName)) {
+        throw new Error(`server listed tool "${tool.name}" more than once — invalid tool list`)
+      }
+      definitions.set(publicName, createDefinition(state, entry.serverName, tool.name, publicName, tool, entry))
+    }
+    const disposers = []
+    for (const [publicName, definition] of definitions) {
+      try {
+        disposers.push(state.agentCtx.tools.register(definition))
+      } catch (error) {
+        log(state.ctx, 'error', `agent ${state.agent.id} (${state.projectRoot}): registering ${publicName} failed: ${String(error)}`)
+      }
+    }
+    return {
+      toolCount: disposers.length,
+      unregister: () => {
+        for (const dispose of disposers) {
+          try { dispose() } catch { /* best effort */ }
+        }
+      },
+    }
+  } finally {
+    try { await client.close() } catch { /* best effort */ }
+  }
+}
+
+async function setupServer(state, entry) {
+  const serverName = entry.serverName
+  const upper = hasServerTools(state.agentCtx, serverName)
+  if (!entry.override && upper) {
+    log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} already provided by preset/host MCP — skipped (set "override": true to force the project connection)`)
+    return
+  }
+  try {
+    const { toolCount, unregister } = await syncSchema(state, entry)
+    if (state.disposed) {
+      // Disposed (or reloaded away) while the schema sync was in flight:
+      // discard the registrations, never leak tools or a record.
+      unregister()
+      return
+    }
+    state.servers.set(serverName, { entry, unregister, conn: null, connecting: null })
+    // override:true with upper-layer registrations present = intentional
+    // double connection. The agent-layer copy SHADOWS the upper layers for
+    // same-named tools (layered registry), but the upper connections stay
+    // alive — say so in the log, since the tool list shows no origin.
+    const shadowed = upper ? ' (agent layer shadows upper-layer registration(s) for same-named tools; upper connections stay alive)' : ''
+    log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): registered ${toolCount} tool(s) from server ${serverName}${shadowed}`)
+  } catch (error) {
+    log(state.ctx, 'error', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} not loaded: ${String(error)}`)
+  }
+}
+
+async function teardownServer(state, record, reason) {
+  state.servers.delete(record.entry.serverName)
+  try { record.unregister() } catch { /* best effort */ }
+  await disconnect(state, record, reason)
 }
 
 // ---------------------------------------------------------------------------
 // config application (initial load + hot reload share one path)
 // ---------------------------------------------------------------------------
 
-async function teardownServer(ctx, state, serverName, record) {
-  try { record.unregister() } catch { /* best effort */ }
-  state.servers.delete(serverName)
-  releasePoolRef(ctx, state.projectRoot, serverName, record.fingerprint).catch(() => {})
-  log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): unregistered server ${serverName}`)
-}
-
-async function setupServer(ctx, state, entry) {
-  const serverName = entry.serverName
-  const upper = hasServerTools(state.agentCtx, serverName)
-  if (!entry.override && upper) {
-    log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} already provided by preset/host MCP — skipped (set "override": true to force the project connection)`)
-    return
-  }
-  try {
-    const promise = await connectServer(ctx, entry, state.projectRoot)
-    const { definitions } = await promise
-    const fingerprint = entryFingerprint(entry)
-    const key = poolKey(state.projectRoot, serverName, fingerprint)
-    poolRefs.set(key, (poolRefs.get(key) ?? 0) + 1)
-    const disposers = []
-    for (const [publicName, definition] of definitions) {
-      try {
-        disposers.push(state.agentCtx.tools.register(definition))
-      } catch (error) {
-        log(ctx, 'error', `agent ${state.agent.id} (${state.projectRoot}): registering ${publicName} failed: ${String(error)}`)
-      }
-    }
-    state.servers.set(serverName, {
-      fingerprint,
-      poolKey: key,
-      unregister: () => {
-        for (const dispose of disposers) {
-          try { dispose() } catch { /* best effort */ }
-        }
-      },
-    })
-    // override:true with upper-layer registrations present = intentional
-    // double connection. The agent-layer copy SHADOWS the upper layers for
-    // same-named tools (layered registry), but the upper connections stay
-    // alive — say so in the log, since the tool list shows no origin.
-    const shadowed = upper ? ' (agent layer shadows upper-layer registration(s) for same-named tools; upper connections stay alive)' : ''
-    log(ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): registered ${disposers.length} tool(s) from server ${serverName}${shadowed}`)
-  } catch (error) {
-    log(ctx, 'error', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} not loaded: ${String(error)}`)
-  }
-}
-
-/**
- * Apply a (possibly new, possibly removed) config to one live agent:
- * generation diff against the agent's current generation. text === null
- * means the config file is gone — everything unloads.
- */
+/** Apply a (possibly new, possibly removed) config to one live agent: FULL rebuild — unregister everything, close everything, re-read, re-register (no fingerprint diffing). text === null means the config file is gone — everything unloads. */
 async function applyConfig(state, text) {
   if (state.disposed) return
   const ctx = state.ctx
@@ -541,25 +541,11 @@ async function applyConfig(state, text) {
     }
     entries.push(...serverEntries(servers, state.projectRoot, (m) => log(ctx, 'warn', `agent ${state.agent.id} (${state.projectRoot}): .dsh/mcp.json: ${m}`)))
   }
-  const next = new Map(entries.map((e) => [e.serverName, e]))
-  const prev = state.servers
-
-  // Removed servers first (so changed ones re-run the dedup check cleanly).
-  for (const [serverName, record] of prev) {
-    if (!next.has(serverName)) await teardownServer(ctx, state, serverName, record)
+  for (const record of [...state.servers.values()]) {
+    await teardownServer(state, record, 'config change — rebuilding')
   }
-  // Added and changed servers. A changed entry has a different fingerprint;
-  // teardown the old generation, then set up the new one — same serverName
-  // keeps the same public tool names, so recorded calls stay replayable.
-  // An unchanged fingerprint is skipped UNLESS the pooled connection died
-  // (supervisor dropped the pool entry) or THIS session's record was marked
-  // dead by the supervisor — both mean the local tool definitions still
-  // bind the dead client and must be rebuilt.
-  for (const [serverName, entry] of next) {
-    const record = prev.get(serverName)
-    if (record !== undefined && record.fingerprint === entryFingerprint(entry) && !record.dead && poolPromises.has(record.poolKey)) continue
-    if (record !== undefined) await teardownServer(ctx, state, serverName, record)
-    await setupServer(ctx, state, entry)
+  for (const entry of entries) {
+    await setupServer(state, entry)
   }
 }
 
@@ -599,6 +585,48 @@ function agentCwd(agent) {
 }
 
 // ---------------------------------------------------------------------------
+// watcher
+// ---------------------------------------------------------------------------
+
+function attachWatcher(state) {
+  const root = state.projectRoot
+  let w = projectWatchers.get(root)
+  if (w === undefined) {
+    w = { controllers: new Set(), timer: null }
+    projectWatchers.set(root, w)
+    const configPath = join(root, '.dsh', 'mcp.json')
+    const onChange = () => {
+      if (w.timer !== null) clearTimeout(w.timer)
+      w.timer = setTimeout(() => {
+        w.timer = null
+        for (const controller of [...w.controllers]) {
+          if (!controller.disposed) enqueue(controller, () => reloadFromDisk(controller))
+        }
+      }, WATCH_DEBOUNCE_MS)
+    }
+    try {
+      watchFile(configPath, { interval: 500 }, onChange)
+    } catch (error) {
+      log(state.ctx, 'warn', `watch ${configPath} failed: ${String(error)} — config hot-reload disabled for this project`)
+    }
+  }
+  w.controllers.add(state)
+  state.watcherRef = w
+}
+
+function detachWatcher(state) {
+  const w = state.watcherRef
+  if (w === undefined) return
+  state.watcherRef = undefined
+  w.controllers.delete(state)
+  if (w.controllers.size === 0) {
+    if (w.timer !== null) clearTimeout(w.timer)
+    try { unwatchFile(join(state.projectRoot, '.dsh', 'mcp.json')) } catch { /* best effort */ }
+    projectWatchers.delete(state.projectRoot)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // plugin
 // ---------------------------------------------------------------------------
 
@@ -635,5 +663,13 @@ export function apply(ctx) {
     const state = agentStates.get(agent.id)
     if (state !== undefined) cleanupState(ctx, state, 'agent disposed')
   })
-  log(ctx, 'info', 'plugin active (v2) — project MCP with config hot-reload')
+  // Plugin unload (HMR/dev reload): tear down every live controller so no
+  // stale wiring keeps watching configs or holding connections after this
+  // instance is gone (module-level state survives ctx disposal otherwise).
+  ctx.effect(() => () => {
+    for (const state of [...agentStates.values()]) {
+      cleanupState(ctx, state, 'plugin reloaded')
+    }
+  })
+  log(ctx, 'info', 'plugin active (v4) — per-agent connections, lazy connect, idle timeout')
 }

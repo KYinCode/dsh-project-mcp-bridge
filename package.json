@@ -1,6 +1,6 @@
 {
   "name": "dsh-project-mcp-bridge",
-  "version": "0.1.11",
+  "version": "0.2.0",
   "description": "Per-project MCP loading for DeepSeek Harness: sessions of a project automatically get the MCP servers declared in its .dsh/mcp.json (mcpServers JSON shape, shared with Claude Code / Cursor / VS Code). Client bridge — consumes MCP servers, not an MCP server, not an official DeepSeek package.",
   "keywords": [
     "deepseek-harness",

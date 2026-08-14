@@ -44,13 +44,26 @@ agent created (agent/created)
   -> for each server entry:
        - if a preset/host MCP row already provides the same serverName
          and the entry has no "override": true  -> skip (log explains why)
-       - else connect (stdio spawn or streamable-http)
-       - list tools, register each as mcp__<serverName>__<rawName>
-         into the AGENT scope layer only (project > preset > host)
-  -> connections are pooled per (projectRoot, serverName) and shared
-     across sessions of the same project; the pool closes when the last
-     session releases it
+       - else one-shot SCHEMA SYNC: connect (stdio spawn or
+         streamable-http) + list tools + register each as
+         mcp__<serverName>__<rawName> into the AGENT scope layer only
+         (project > preset > host) + close again
+  -> no connection is kept: an idle session holds no child process
+
+first call to a server's tool (execute)
+  -> the agent's controller checks its per-server connection
+  -> absent -> LAZY CONNECT ("connecting..." is logged; this is the
+     first-call latency) -> call
+  -> every call re-arms a per-connection idle timer (default 5 min);
+     on fire the connection closes and the child process is released;
+     the next call reconnects transparently
+  -> if the connection dies (onclose), this agent drops it and the next
+     call reconnects — no broadcast, no shared state
 ```
+
+Connections are **per agent, never pooled**: N sessions calling the same
+server run N independent processes (isolation over sharing). Sessions that
+never call a server hold no process at all.
 
 ## Installation
 
@@ -106,7 +119,8 @@ opt-in; sessions of projects without it are untouched):
     "github": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" },
+      "idleTimeoutMs": 300000
     },
     "local-api": {
       "url": "http://localhost:3000/mcp",
@@ -130,6 +144,7 @@ opt-in; sessions of projects without it are untouched):
 | `url` | http | yes | MCP server URL |
 | `headers` | http | no | extra headers |
 | `toolCallTimeoutMs` | both | no | per-call timeout (default 60000) |
+| `idleTimeoutMs` | both | no | idle disconnect after this many ms without a call (default 300000 = 5 min; `0` = never disconnect) |
 | `override` | both | no | force this project connection even if a preset/host row already provides the same serverName (default false) |
 
 `${NAME}` placeholders in `env`/`headers` values are expanded from the
@@ -163,38 +178,44 @@ host process environment.
   preset vs host duplicates among `dsh-mcp-client` rows → rename one.
 
 
-## Config hot-reload (v2)
+## Config hot-reload
 
 Saving `.dsh/mcp.json` re-resolves the config for **every running session**
-of that project and swaps generations live:
+of that project and **fully rebuilds** each session's project MCP surface:
 
-- **added server** → connect + register tools (running sessions gain them)
-- **removed server** → unregister tools + release the pooled connection
-- **changed server** → teardown the old generation, connect the new one —
-  same serverName keeps the same public tool names, so recorded tool calls
-  stay replayable
+- **added server** → schema sync + register tools (running sessions gain them)
+- **removed server** → unregister tools + close its connection
+- **changed server** → full rebuild — unregister everything, close all
+  connections, re-read, re-register. No fingerprint diffing: a change simply
+  rebuilds. Same serverName keeps the same public tool names, so recorded
+  tool calls stay replayable
 - **deleted config** → all project MCP tools unload
 
 No new session needed. The file is polled (`fs.watchFile`, ~500 ms) with a
-300 ms debounce. Reconnect happens per server; an in-flight tool call on a
-server being reconfigured may be interrupted by the swap.
+300 ms debounce, fanned out to every live session of the project. An
+in-flight tool call on a server being reconfigured may be interrupted by the
+rebuild.
 
-A change applies to **every running session of that project**: the
-per-project watcher fans out to all live sessions, and each session
-re-registers its own tool view (one per agent scope — required by the
-layered registry). Connections stay pooled: N sessions sharing one server
-still share one connection, so the cost is N registrations, not N
-processes.
-
-**Connection supervisor (v3)**: if a server's process dies, the SDK's
-`onclose` fires, the dead pool entry is dropped, and every live session of
-the project rebuilds automatically (~seconds) — no restart, no new
-session, no config change. A rebuild that fails does not retry on its own
-(no reconnect loop); the next trigger (config change, new session, another
-death) retries. Note: after a rebuild, the server's *internal* dependencies
+**Connection death (v4)**: if a server's process dies, the SDK's `onclose`
+fires and that agent drops its dead connection; the **next call reconnects**
+automatically (lazy) — no restart, no new session, no config change. Each
+agent is self-managed: nothing is broadcast, so a death in one session never
+disturbs another. A reconnect that fails surfaces as a tool error; the next
+call retries. Note: after a reconnect, the server's *internal* dependencies
 (e.g. a browser connection) may take a few more seconds to become ready —
 calls in that window can fail with the server's own error; this is server
 behavior, not a bridge defect.
+
+**Idle disconnect**: connections close after `idleTimeoutMs` without a call
+(default 5 min; per-server configurable, `0` = never). An idle session holds
+no child process; the next call reconnects transparently (only latency).
+
+**Lazy connect caveat**: tool schemas only exist on the server, so session
+creation performs a brief one-shot schema sync per accepted server (connect
++ list tools + register + close). Sessions that never call a server pay only
+this brief spawn; no connection is kept afterwards. If the schema sync fails
+(server down at creation), that server's tools are not registered until the
+next config change or a new session.
 
 ## Environment scrubbing (privilege reduction)
 
@@ -224,9 +245,11 @@ does not and cannot make untrusted projects safe.
 
 ## Limitations
 
-- Resources and prompts from MCP servers are not bridged (tools only).- Connections are shared per (projectRoot, serverName): sessions of the
-  same project share one connection; it closes when the last session
-  releases it.
+- Resources and prompts from MCP servers are not bridged (tools only).
+- Connections are **per agent, never pooled**: N sessions calling the same
+  server = N processes. Heavy servers (e.g. chrome-devtools) cost one
+  process per active session — the idle timeout keeps unused ones short-
+  lived. Session creation also pays one brief schema-sync spawn per server.
 - Streaming/task-based MCP execution is not supported (call only).
 
 ## Further reading
