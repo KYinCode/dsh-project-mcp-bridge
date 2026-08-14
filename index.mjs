@@ -325,16 +325,21 @@ async function connectServer(ctx, entry, projectRoot) {
       }
       // v3: live connection supervisor. The SDK fires client.onclose when the
       // stdio child dies (verified on Windows force-kill). Drop the dead pool
-      // entry and re-resolve every live session of this project: reload sees
-      // the config still present, the pool empty, and rebuilds the connection.
+      // entry, mark every live session's record for this server as DEAD (so
+      // their reload cannot skip on the same fingerprint), and re-resolve:
+      // each session tears down its stale tool generation and rebuilds,
+      // sharing the one re-established pool connection.
       client.onclose = () => {
         if (poolPromises.get(key) !== attempt) return // superseded by a newer generation
         poolPromises.delete(key)
         log(ctx, 'warn', `server ${entry.serverName} (${projectRoot}): connection closed — reconnecting`)
         for (const state of agentStates.values()) {
-          if (!state.disposed && state.projectRoot === projectRoot) {
-            enqueue(state, () => reloadFromDisk(state))
+          if (state.disposed || state.projectRoot !== projectRoot) continue
+          const record = state.servers.get(entry.serverName)
+          if (record !== undefined && record.fingerprint === fingerprint) {
+            record.dead = true
           }
+          enqueue(state, () => reloadFromDisk(state))
         }
       }
       return { client, transport, definitions }
@@ -547,10 +552,12 @@ async function applyConfig(state, text) {
   // teardown the old generation, then set up the new one — same serverName
   // keeps the same public tool names, so recorded calls stay replayable.
   // An unchanged fingerprint is skipped UNLESS the pooled connection died
-  // (the supervisor's onclose dropped the pool entry) — then rebuild.
+  // (supervisor dropped the pool entry) or THIS session's record was marked
+  // dead by the supervisor — both mean the local tool definitions still
+  // bind the dead client and must be rebuilt.
   for (const [serverName, entry] of next) {
     const record = prev.get(serverName)
-    if (record !== undefined && record.fingerprint === entryFingerprint(entry) && poolPromises.has(record.poolKey)) continue
+    if (record !== undefined && record.fingerprint === entryFingerprint(entry) && !record.dead && poolPromises.has(record.poolKey)) continue
     if (record !== undefined) await teardownServer(ctx, state, serverName, record)
     await setupServer(ctx, state, entry)
   }
