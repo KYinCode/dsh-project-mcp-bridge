@@ -1,12 +1,36 @@
 # dsh-project-mcp-bridge
 
-宿主平面 DSH 插件：**按项目加载 MCP 服务器**。在项目根目录放一个
-`.dsh/mcp.json`（与 Claude Code、Cursor、VS Code 共享的 `mcpServers` JSON
-结构），该项目的会话自动获得这些服务器的工具，名为
-`mcp__<serverName>__<rawName>`。
+[English](README.md) | [中文](README.zh.md)
 
-这是一个**客户端桥接插件**——它消费 MCP 服务器。它不是 MCP 服务器，也
-不是 DeepSeek 官方包。
+> **一句话**——让每个项目自己声明要用哪些 MCP 服务器。在项目根目录放一个
+> `.dsh/mcp.json`，该项目的所有会话就有了这些服务器的工具
+> （`mcp__<serverName>__<toolName>`），改文件**即时生效**——不用新开会话，
+> 不用重启。
+>
+> 它是**客户端桥接插件**（消费 MCP 服务器）。不是 MCP 服务器，不是
+> DeepSeek 官方包。
+
+## 30 秒上手
+
+```jsonc
+// 你的项目/.dsh/mcp.json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+然后，在该项目打开的任何会话里，模型可以直接调用 `mcp__github__create_issue`
+等工具——与 Claude Code、Cursor、VS Code 相同的 `mcpServers` JSON 结构。
+以后再改这个文件，运行中的会话约 1 秒内就会跟上。
+
+安装一次：`dsh plugin --profile web add dsh-project-mcp-bridge`（重启一次），
+或见[安装](#安装)章节的免重启开发路径。
 
 ---
 
@@ -40,6 +64,29 @@ dsh plugin --profile web add dsh-project-mcp-bridge
 **装完重启一次 `dsh web`**：bundle 层在启动时组合（只有用户补丁层和
 `settings.yaml` 是热重载的）。重启之后，`.dsh/mcp.json` 的修改全部热生效
 （见"配置热重载"）。
+
+### 免重启开发路径（热安装）
+
+如果你要反复改这个插件本身、希望改动**不重启就生效**，可以用**用户补丁
+行**安装（而不是 bundle）。行内用**包名**引用（从 profile 的
+`node_modules` 解析），可移植且热：
+
+```bash
+cd ~/.dsh/profiles/web
+pnpm add dsh-project-mcp-bridge          # 装进 node_modules（不触发 reconcile）
+```
+
+然后在 `~/.dsh/profiles/web/cordis.patch.yml` 追加：
+
+```yaml
+- insert:
+    - id: dsh-project-mcp-bridge
+      name: 'dsh-project-mcp-bridge'     # 包名，不是 file:// 路径
+```
+
+用户补丁层热重载（约 4 秒），行会**无需重启**生效。注意：此路径**不要用**
+`dsh plugin add`——那会同时注册 bundle，下次重启后产生重复行。日常使用
+推荐 bundle 安装；此路径仅用于本机迭代。
 
 ## 项目配置
 

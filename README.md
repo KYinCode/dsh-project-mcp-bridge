@@ -1,12 +1,38 @@
 # dsh-project-mcp-bridge
 
-A host-plane DSH plugin that loads **MCP servers per project**. Drop a
-`.dsh/mcp.json` (the `mcpServers` JSON shape shared by Claude Code, Cursor
-and VS Code) into a project root, and every session of that project
-automatically gets the servers' tools as `mcp__<serverName>__<rawName>`.
+[English](README.md) | [中文](README.zh.md)
 
-This is a **client bridge** — it consumes MCP servers. It is not an MCP
-server, and it is not an official DeepSeek package.
+> **TL;DR** — Let each project declare its own MCP servers. Drop a
+> `.dsh/mcp.json` into a project root; every session of that project then
+> has those servers' tools (`mcp__<serverName>__<toolName>`), and editing
+> the file takes effect **live** — no new session, no restart.
+>
+> It is a **client bridge** (consumes MCP servers). Not an MCP server, not
+> an official DeepSeek package.
+
+## 30-second demo
+
+```jsonc
+// MyProject/.dsh/mcp.json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" }
+    }
+  }
+}
+```
+
+Then, in any session opened in `MyProject`, the model can directly call
+`mcp__github__create_issue` etc. — the same `mcpServers` JSON shape used by
+Claude Code, Cursor and VS Code. Save the file again later and running
+sessions pick the change up within ~1 s.
+
+Install once: `dsh plugin --profile web add dsh-project-mcp-bridge` (one
+restart), or see [Installation](#installation) for the restart-free dev
+path.
 
 ---
 
@@ -43,6 +69,31 @@ the profile's bundle layers automatically. The bundle's own
 **Restart `dsh web` once** after installing: bundle layers are composed at
 startup (only the user patch layer and `settings.yaml` are hot-reloaded).
 After that, `.dsh/mcp.json` changes are hot (see Config hot-reload).
+
+### Restart-free dev path (hot install)
+
+If you iterate on this plugin itself and want changes live without
+restarts, install it as a **user patch row** instead of a bundle. The row
+references the package by **name** (resolved from the profile's
+`node_modules`), so it is portable and hot:
+
+```bash
+cd ~/.dsh/profiles/web
+pnpm add dsh-project-mcp-bridge          # package into node_modules (no reconcile)
+```
+
+Then append to `~/.dsh/profiles/web/cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: dsh-project-mcp-bridge
+      name: 'dsh-project-mcp-bridge'     # package name, NOT a file:// path
+```
+
+The user patch layer is hot-reloaded (~4 s), so the row activates without
+a restart. Note: do NOT use `dsh plugin add` for this path — it would also
+register the bundle and duplicate the row after the next restart. Prefer
+the bundle install for normal use; this path is for local iteration.
 
 ## Project config
 
