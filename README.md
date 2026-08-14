@@ -28,22 +28,21 @@ agent created (agent/created)
 
 ## Installation
 
-1. The plugin row must be present in the host composition's user patch
-   layer (`~/.dsh/profiles/web/cordis.patch.yml`):
+The package is a **profile bundle**: install with the dsh CLI, no manual
+patching.
 
-   ```yaml
-   - insert:
-       - id: dsh-project-mcp-bridge
-         name: 'file:///C:/Users/KYin/.dsh/profiles/web/plugins/dsh-project-mcp-bridge/index.mjs'
-   ```
+```bash
+dsh plugin --profile web add dsh-project-mcp-bridge
+```
 
-   The user patch layer is hot-reloaded (HMR): saving the file takes
-   effect in ~4 s — no process restart. To reload after editing the plugin
-   module itself, bump the `?v=N` query on the `name` URL (HMR watches the
-   patch file, not the plugin file; a changed URL forces the row to reload).
+`dsh plugin` runs pnpm in the profile directory, then reconciles
+`dsh.profile.bundles`: the package declares `dsh.bundle.patch`, so it joins
+the profile's bundle layers automatically. The bundle's own
+`cordis.patch.yml` supplies the plugin row — nothing to add by hand.
 
-2. Restart is only needed if the patch file is added before the HMR
-   watcher was ever running (i.e. at first boot).
+**Restart `dsh web` once** after installing: bundle layers are composed at
+startup (only the user patch layer and `settings.yaml` are hot-reloaded).
+After that, `.dsh/mcp.json` changes are hot (see Config hot-reload).
 
 ## Project config
 

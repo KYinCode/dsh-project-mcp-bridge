@@ -26,17 +26,20 @@ agent 创建（agent/created）
 
 ## 安装
 
-1. 在宿主组装的用户补丁层（`~/.dsh/profiles/web/cordis.patch.yml`）加入插件行：
+本包是 **profile bundle**：用 dsh CLI 安装，无需手动改任何配置文件。
 
-   ```yaml
-   - insert:
-       - id: dsh-project-mcp-bridge
-         name: 'file:///C:/Users/KYin/.dsh/profiles/web/plugins/dsh-project-mcp-bridge/index.mjs'
-   ```
+```bash
+dsh plugin --profile web add dsh-project-mcp-bridge
+```
 
-   用户补丁层支持 **HMR 热重载**：保存文件约 4 秒生效，**无需重启进程**。
-   修改插件模块本身后，需要 bump `name` URL 的 `?v=N`（HMR 监视的是补丁
-   文件而非插件文件；URL 变化才会强制该行重载）。
+`dsh plugin` 会在 profile 目录运行 pnpm，然后自动核对
+`dsh.profile.bundles`：本包声明了 `dsh.bundle.patch`，会自动加入 profile
+的 bundle 层。插件行由包自带的 `cordis.patch.yml` 提供——**不需要手写任何
+行**。
+
+**装完重启一次 `dsh web`**：bundle 层在启动时组合（只有用户补丁层和
+`settings.yaml` 是热重载的）。重启之后，`.dsh/mcp.json` 的修改全部热生效
+（见"配置热重载"）。
 
 ## 项目配置
 
