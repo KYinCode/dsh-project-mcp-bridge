@@ -491,7 +491,7 @@ async function syncSchema(state, entry) {
 
 async function setupServer(state, entry) {
   const serverName = entry.serverName
-  const upper = hasServerTools(state.agentCtx, serverName)
+  const upper = hasServerTools(state, serverName)
   if (!entry.override && upper) {
     log(state.ctx, 'info', `agent ${state.agent.id} (${state.projectRoot}): server ${serverName} already provided by preset/host MCP — skipped (set "override": true to force the project connection)`)
     return
@@ -569,9 +569,13 @@ async function reloadFromDisk(state) {
   }
 }
 
-function hasServerTools(agentCtx, serverName) {
+function hasServerTools(state, serverName) {
   try {
-    const schemas = agentCtx.tools.schemas()
+    // The agent-scoped view, not the omitted-argument global view: upper
+    // layers (preset AND global) both register into the agent's visible
+    // chain, and skip must honor both. A bare schemas() call only sees the
+    // global layer and would miss preset-layer servers.
+    const schemas = state.agentCtx.tools.schemas(state.agent)
     return Array.isArray(schemas) && schemas.some((s) => typeof s.name === 'string' && s.name.startsWith(`mcp__${serverName}__`))
   } catch {
     return false

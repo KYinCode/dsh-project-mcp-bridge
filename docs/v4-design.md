@@ -151,8 +151,29 @@ idle-timeout 和 auto-reconnect（与我们要做的方向一致）。
 | 3 | 并发隔离：两会话同时调用同一 MCP → 两个独立进程 | ✅ 集成测试 live=2；并行首次调用共享同一连接（去重）也通过 |
 | 4 | 重连（kill）：kill 进程 → onclose → 下次调用自动重连 | ✅ SIGKILL 实测，onclose 日志 + 自动重连 |
 | 5 | 热重载：改 mcp.json → 本会话工具集更新（全量重建） | ✅ 新增服务器、清空配置、删除配置文件三种情况 |
-| 6 | 冲突语义：skip / override 行为不变 | ✅ 上层 schema 存在 → skip；override → 强制注册 + shadow 日志 |
+| 6 | 冲突语义：skip / override 行为不变 | ✅ 全局层 + 预设层双实测（见下） |
 | 7 | 多会话对比：进程数 = 会话数 | ✅ 两 agent 各持一进程，空闲后全部释放 |
+
+### 冲突语义实测（全局层 + 预设层）与 0.2.1 修复
+
+测试计划第 6 项在真实 harness 里分两层验证：
+
+- **全局层**：profile patch 插入官方 `dsh-mcp-client` 行（serverName `test`）→
+  项目会话 skip（`already provided by preset/host MCP — skipped`）；加
+  `override: true` → 强制注册 + shadows 日志。✅
+- **预设层**：`~/.dsh/.agent-presets/v4-mcp-test/` 预设（内含 mcp-client 行，
+  serverName `testp`），设置默认预设后新会话挂载 → 期望 skip。**首次实测
+  失败**：testp 照常注册。排查发现这是从 v3 沿用至今的**实现缺陷**：
+  `hasServerTools` 调用 `tools.schemas()`（无参）——dsh-tools 的注释明确
+  无参 = **全局视图**（global view），只含 host 组合层；**预设层注册在
+  agent 的可见链上，全局视图看不到**。全局层冲突恰好可见（所以旧测试
+  从未暴露），预设层冲突永远检测不到 → 项目重复注册（agent 层遮蔽预设层）。
+  修复（0.2.1）：`hasServerTools` 改传 agent 视角
+  `tools.schemas(state.agent)`（与 dsh-tool-cordis 等宿主调用一致），
+  覆盖完整可见链（agent + 预设 + 全局）。修复后重测：testp skip ✅、
+  全局层 test skip ✅（回归）、override 强制 ✅。测试期间另确认：预设的
+  mcp-client 是 eager 常驻连接（官方桥设计，无空闲超时），与本插件懒连接
+  形成对照。
 
 额外发现并修复的两个问题（均记入代码注释）：
 
