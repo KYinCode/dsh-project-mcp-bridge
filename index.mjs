@@ -546,9 +546,11 @@ async function applyConfig(state, text) {
   // Added and changed servers. A changed entry has a different fingerprint;
   // teardown the old generation, then set up the new one — same serverName
   // keeps the same public tool names, so recorded calls stay replayable.
+  // An unchanged fingerprint is skipped UNLESS the pooled connection died
+  // (the supervisor's onclose dropped the pool entry) — then rebuild.
   for (const [serverName, entry] of next) {
     const record = prev.get(serverName)
-    if (record !== undefined && record.fingerprint === entryFingerprint(entry)) continue
+    if (record !== undefined && record.fingerprint === entryFingerprint(entry) && poolPromises.has(record.poolKey)) continue
     if (record !== undefined) await teardownServer(ctx, state, serverName, record)
     await setupServer(ctx, state, entry)
   }
