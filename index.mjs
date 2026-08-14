@@ -323,6 +323,20 @@ async function connectServer(ctx, entry, projectRoot) {
         }
         definitions.set(publicName, createDefinition(client, tool.name, publicName, tool, entry))
       }
+      // v3: live connection supervisor. The SDK fires client.onclose when the
+      // stdio child dies (verified on Windows force-kill). Drop the dead pool
+      // entry and re-resolve every live session of this project: reload sees
+      // the config still present, the pool empty, and rebuilds the connection.
+      client.onclose = () => {
+        if (poolPromises.get(key) !== attempt) return // superseded by a newer generation
+        poolPromises.delete(key)
+        log(ctx, 'warn', `server ${entry.serverName} (${projectRoot}): connection closed — reconnecting`)
+        for (const state of agentStates.values()) {
+          if (!state.disposed && state.projectRoot === projectRoot) {
+            enqueue(state, () => reloadFromDisk(state))
+          }
+        }
+      }
       return { client, transport, definitions }
     } catch (error) {
       try { await client.close() } catch { /* best effort */ }
