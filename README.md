@@ -96,6 +96,22 @@ host process environment.
   project tools win).
 - Different serverNames or different tool names coexist freely.
 
+## Config hot-reload (v2)
+
+Saving `.dsh/mcp.json` re-resolves the config for **every running session**
+of that project and swaps generations live:
+
+- **added server** → connect + register tools (running sessions gain them)
+- **removed server** → unregister tools + release the pooled connection
+- **changed server** → teardown the old generation, connect the new one —
+  same serverName keeps the same public tool names, so recorded tool calls
+  stay replayable
+- **deleted config** → all project MCP tools unload
+
+No new session needed. The file is polled (`fs.watchFile`, ~500 ms) with a
+300 ms debounce. Reconnect happens per server; an in-flight tool call on a
+server being reconfigured may be interrupted by the swap.
+
 ## Environment scrubbing (privilege reduction)
 
 MCP children are spawned with the official `scrubbedParentEnv()`: the
@@ -124,12 +140,6 @@ does not and cannot make untrusted projects safe.
 
 ## Limitations
 
-- **Config hot-reload is live (v2)**: saving `.dsh/mcp.json` re-resolves
-  the config for every running session of that project and swaps
-  generations — added servers gain tools, removed servers lose them,
-  changed servers reconnect (same serverName keeps stable tool names, so
-  recorded calls stay replayable). A deleted config unloads everything.
-  No new session needed.
 - Resources and prompts from MCP servers are not bridged (tools only).
 - Connections are shared per (projectRoot, serverName): sessions of the
   same project share one connection; it closes when the last session
