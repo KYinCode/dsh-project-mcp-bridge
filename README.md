@@ -162,6 +162,13 @@ No new session needed. The file is polled (`fs.watchFile`, ~500 ms) with a
 300 ms debounce. Reconnect happens per server; an in-flight tool call on a
 server being reconfigured may be interrupted by the swap.
 
+A change applies to **every running session of that project**: the
+per-project watcher fans out to all live sessions, and each session
+re-registers its own tool view (one per agent scope — required by the
+layered registry). Connections stay pooled: N sessions sharing one server
+still share one connection, so the cost is N registrations, not N
+processes.
+
 ## Environment scrubbing (privilege reduction)
 
 MCP children are spawned with the official `scrubbedParentEnv()`: the
